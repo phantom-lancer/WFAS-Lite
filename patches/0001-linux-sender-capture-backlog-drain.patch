@@ -1,0 +1,44 @@
+diff --git a/src/main/native/audio_engine.c b/src/main/native/audio_engine.c
+index 4d781cc..130eebb 100644
+--- a/src/main/native/audio_engine.c
++++ b/src/main/native/audio_engine.c
+@@ -1379,11 +1379,17 @@ static jboolean pulse_read(int16_t *buf, int num_stereo_samples) {
+         return JNI_FALSE;
+     }
+ 
+-    /* Drift detection: se pa_simple_read ha impiegato meno del 50% del tempo
+-     * reale atteso, significa che il buffer aveva già dati accumulati
+-     * (latenza in crescita). Accumulo il debito e quando supera 200 ms
+-     * ricreo il stream per azzerare. g_pa_reading rimane 1 per proteggere
+-     * pulse_flush_stream da pulse_stop concorrente. */
++    /* Drift/backlog detection.  If pa_simple_read returns much sooner than
++     * real time, the capture buffer already holds queued audio (a backlog).
++     * Sending that backlog to the network as fast as possible makes the
++     * receiver overflow and discard audio, which is audible as clicks.
++     *
++     * Previously the code waited until 200 ms had accumulated and then
++     * recreated the whole PulseAudio stream.  Recreating the stream is
++     * expensive (it can glitch) and, more importantly, it lets up to those
++     * 200 ms of backlog reach the network first.  Drain the backlog in place
++     * instead, so at most one ~10 ms read slips through, and keep the stream
++     * alive.  g_pa_reading stays 1 to protect a concurrent pulse_stop. */
+     if (!g_pa_stopping) {
+         if (g_drift_skips > 0) {
+             g_drift_skips--;
+@@ -1392,10 +1398,13 @@ static jboolean pulse_read(int16_t *buf, int num_stereo_samples) {
+                               + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+             if (elapsed_ms < expected_ms * 0.5) {
+                 g_drift_ms += expected_ms - elapsed_ms;
+-                if (g_drift_ms > 200.0) {
+-                    AE_LOG("[AudioEngine/Linux] Drift latenza %.0f ms — stream ricreato.\n",
++                if (g_drift_ms > 50.0) {
++                    AE_LOG("[AudioEngine/Linux] Backlog cattura %.0f ms — drain in place.\n",
+                         g_drift_ms);
+-                    pulse_flush_stream();
++                    pulse_drain_stream();
++                    g_drift_ms    = 0.0;
++                    g_drift_skips = 3; /* let the stream settle after the drain */
++                    if (!g_pa_stream) pulse_flush_stream();
+                 }
+             } else {
+                 g_drift_ms = 0.0;
