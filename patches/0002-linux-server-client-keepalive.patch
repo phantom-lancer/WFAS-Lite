@@ -1,0 +1,83 @@
+diff --git a/src/main/kotlin/Main.kt b/src/main/kotlin/Main.kt
+index e333b84..7d52250 100644
+--- a/src/main/kotlin/Main.kt
++++ b/src/main/kotlin/Main.kt
+@@ -575,6 +575,12 @@ object NetworkHandler_v1 {
+     }
+ 
+     private const val SILENT_PEER_TIMEOUT_MS = 6000L
++    // A client that has sent at least one CLIENT_PING must keep sending them.
++    // Ten seconds is ten missed 1 Hz PINGs: long enough to survive a Wi-Fi
++    // hiccup, short enough to release a dead unicast session automatically.
++    // Clients that never send CLIENT_PING (official 1.2.0 clients) keep the
++    // old behaviour, so this does not break protocol compatibility.
++    private const val CLIENT_KEEPALIVE_TIMEOUT_MS = 10_000L
+ 
+     fun clearProtocolMismatch() { protocolMismatch.value = null }
+ 
+@@ -3008,6 +3014,11 @@ object NetworkHandler_v1 {
+                             }
+ 
+                             val clientAlive = java.util.concurrent.atomic.AtomicBoolean(true)
++                            // A client that speaks CLIENT_PING must keep doing so.
++                            // Older/official clients never send it, so they keep
++                            // the original send-failure-only behaviour.
++                            val clientKeepaliveSeen = java.util.concurrent.atomic.AtomicBoolean(false)
++                            val lastClientSeen = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+ 
+                             val pingJob = launch {
+                                 var failures = 0
+@@ -3023,6 +3034,15 @@ object NetworkHandler_v1 {
+                                             clientAlive.set(false)
+                                         }
+                                     }
++                                    // Detect a client that vanished without CLIENT_BYE.
++                                    // UDP sends to a dead peer do not fail, so the
++                                    // old code could hold the unicast session (and
++                                    // keep discovery suppressed) forever.
++                                    if (clientKeepaliveSeen.get() &&
++                                        System.currentTimeMillis() - lastClientSeen.get() > CLIENT_KEEPALIVE_TIMEOUT_MS) {
++                                        AppDebug.log("[SERVER][UNICAST] no CLIENT_PING for ${CLIENT_KEEPALIVE_TIMEOUT_MS}ms, releasing session with $clientAddress")
++                                        clientAlive.set(false)
++                                    }
+                                 }
+                             }
+ 
+@@ -3037,16 +3057,31 @@ object NetworkHandler_v1 {
+                                         // altrui. Ai terzi si risponde "occupato".
+                                         if (datagram.address != clientAddress) {
+                                             if (msg.startsWith(CLIENT_HELLO_MESSAGE) || msg == "MODE_PROBE") {
+-                                                AppDebug.log("[SERVER][UNICAST] ${datagram.address} rejected: busy with $clientAddress")
+-                                                runCatching {
+-                                                    socket.send(Datagram(
+-                                                        buildPacket { writeText(BUSY_MESSAGE) },
+-                                                        datagram.address
+-                                                    ))
++                                                val stale = clientKeepaliveSeen.get() &&
++                                                    System.currentTimeMillis() - lastClientSeen.get() > CLIENT_KEEPALIVE_TIMEOUT_MS
++                                                if (stale) {
++                                                    // The current peer stopped answering its
++                                                    // keepalive.  Release the session instead of
++                                                    // keeping the new client in a WFAS_BUSY loop.
++                                                    AppDebug.log("[SERVER][UNICAST] stale session with $clientAddress, releasing for ${datagram.address}")
++                                                    clientAlive.set(false)
++                                                } else {
++                                                    AppDebug.log("[SERVER][UNICAST] ${datagram.address} rejected: busy with $clientAddress")
++                                                    runCatching {
++                                                        socket.send(Datagram(
++                                                            buildPacket { writeText(BUSY_MESSAGE) },
++                                                            datagram.address
++                                                        ))
++                                                    }
+                                                 }
+                                             }
+                                             continue
+                                         }
++                                        lastClientSeen.set(System.currentTimeMillis())
++                                        if (msg == "CLIENT_PING") {
++                                            clientKeepaliveSeen.set(true)
++                                            continue
++                                        }
+                                         if (msg == "CLIENT_BYE") {
+                                             AppDebug.log("---Received CLIENT_BYE from $clientAddress ---")
+                                             clientAlive.set(false)

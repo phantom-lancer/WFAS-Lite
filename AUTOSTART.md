@@ -97,25 +97,40 @@ What it does:
 1. Makes the AppImage executable (if needed).
 2. Writes `~/.local/bin/wfas-server-autostart.sh`, which:
    * takes an exclusive `flock` on `~/.cache/wfas-lite/server.lock`
-     (PID-file fallback if `flock` is unavailable), so a second server instance
+     (PID-file fallback if `flock` is unavailable), so a second wrapper instance
      exits immediately;
-   * appends output to `~/.local/state/wfas-lite/server.log`;
-   * `exec`s the AppImage with `--server --persist`.
+   * refuses to start if UDP 9090 is already in use (for example a server
+     started manually or by an older menu entry), which prevents the duplicate
+     server that caused stuck `WFAS_BUSY` sessions;
+   * runs the AppImage with `--server --persist` in its own process group
+     (`setsid`) and forwards TERM/INT/HUP to that group, so the AppImage
+     runtime and the extracted `WiFi Audio Streaming` server both stop on
+     logout/shutdown;
+   * after the runtime exits, stops a leftover process still listening on 9090;
+   * appends output to `~/.local/state/wfas-lite/server.log`.
 3. Writes `~/.config/autostart/wfas-server.desktop` (`OnlyShowIn=XFCE;`,
-   `Terminal=false`, 3 s delay).
+   `Terminal=false`, 3 s delay) **and**
+   `~/.local/share/applications/wfas-server.desktop`. Both point at the same
+   wrapper, so a menu launch cannot bypass the single-instance guard.
 
 No `sudo` is used and nothing outside `$HOME` is modified.
+
+If an older `~/.local/share/applications/wfas-server.desktop` exists (for
+example one that launches the AppImage directly), rerun `install-linux.sh` once
+to replace it with the wrapper-based entry.
 
 ### Verify
 
 ```bash
 cat ~/.config/autostart/wfas-server.desktop
-pgrep -af WiFiAudioStreaming.AppImage
+cat ~/.local/share/applications/wfas-server.desktop
+pgrep -af 'WiFiAudioStreaming.AppImage|WiFi Audio Streaming'
+ss -lunp | grep 9090
 tail -n 20 ~/.local/state/wfas-lite/server.log
 ```
 
-Only one process must match. Starting the desktop entry twice is safe: the
-second wrapper exits because the lock is held.
+Only one UDP 9090 owner must exist. Starting the desktop entry twice is safe:
+the second wrapper exits because the lock is held or the port is busy.
 
 ### Uninstall
 
@@ -125,7 +140,10 @@ second wrapper exits because the lock is held.
 ./uninstall-linux.sh --stop
 ```
 
-The log is kept. The AppImage itself is never deleted.
+`--stop` asks the wrapper and the AppImage to stop, then stops whatever still
+listens on UDP 9090 (the real server process is named `WiFi Audio Streaming`,
+not `WiFiAudioStreaming`). The log is kept. The AppImage itself is never
+deleted.
 
 ## Notes
 

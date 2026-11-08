@@ -32,6 +32,10 @@ struct SessionConfig {
     unsigned handshake_timeout_ms{15000};
     unsigned ping_timeout_ms{3000};
     int socket_receive_buffer_bytes{1 << 20};
+    // Preferred local UDP port.  A stable value lets a restarted client send
+    // CLIENT_BYE from the same source address and release its own stale
+    // session; 0 means ephemeral.
+    unsigned short preferred_local_port{0};
     bool verbose{true};
 };
 
@@ -74,9 +78,14 @@ public:
     UdpClientSocket(const UdpClientSocket&) = delete;
     UdpClientSocket& operator=(const UdpClientSocket&) = delete;
 
-    bool open(int receive_buffer_bytes, std::string& error);
+    bool open(int receive_buffer_bytes, unsigned short preferred_local_port,
+              std::string& error);
     void close();
     bool is_open() const { return handle_ != kInvalid; }
+    // Local UDP port actually bound (39090 normally, an ephemeral port if it
+    // was busy).  A stable port lets a restarted client release its own stale
+    // server session with CLIENT_BYE.
+    unsigned short local_port() const { return local_port_; }
     bool connect_to(const std::string& ip, unsigned short port,
                     std::string& error);
     bool send_text(const std::string& text, std::string& error);
@@ -90,6 +99,7 @@ private:
     static constexpr std::uintptr_t kInvalid = static_cast<std::uintptr_t>(~0ull);
     std::uintptr_t handle_{kInvalid};
     bool connected_{};
+    unsigned short local_port_{};
     int last_error_code_{};
 };
 

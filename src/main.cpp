@@ -216,12 +216,14 @@ int main(int argc, char** argv) {
     }
 
     wfas::UdpClientSocket client_socket;
-    if (!client_socket.open(1 << 20, error)) {
+    if (!client_socket.open(1 << 20, 39090, error)) {
         std::cerr << "Error: " << error << "\n";
         sink->stop();
         WSACleanup();
         return 1;
     }
+    std::cout << "Local UDP port: " << client_socket.local_port()
+              << " (stable across reconnects and restarts when free).\n";
 
     wfas::DiscoveryListener discovery;
     bool discovery_ready = false;

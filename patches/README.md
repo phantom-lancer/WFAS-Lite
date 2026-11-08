@@ -19,6 +19,69 @@ It changes one branch in `src/main/native/audio_engine.c`:
 cleared concurrently by `pulse_stop()`. No protocol, packet format, or Kotlin
 code is touched.
 
+# Server patch — dead-client session release
+
+`0002-linux-server-client-keepalive.patch` (base `abdc0ab`)
+
+## Why
+
+The upstream unicast server has no client liveness check. `PING` is sent by the
+server only; the client sends nothing during a session. If the client vanishes
+(power loss, killed process, Wi-Fi gone), `clientAlive` stays true forever, the
+server keeps the unicast session and, crucially, keeps calling
+`stopAnnouncingPresence()`. Every new client then receives `WFAS_BUSY`, and no
+discovery beacon is sent until the server process is killed manually. This is
+the confirmed A.6 failure mode.
+
+## What it changes
+
+* The Windows client sends `CLIENT_PING` every 3 s and after each server `PING`.
+  This is an additive ASCII control message; the official 1.2.0 server ignores
+  unknown control messages, so the client remains compatible.
+* The patched server tracks `lastClientSeen` for the active peer. Once a client
+  has sent at least one `CLIENT_PING`, a 10 s silence releases the session
+  (`clientAlive = false`). The session `finally` block stops the engine and the
+  `--persist` loop starts announcing again.
+* A new `HELLO` from a different peer releases an already-stale session instead
+  of answering `WFAS_BUSY`, so a reconnect does not have to wait for the next
+  watchdog tick.
+* Clients that never send `CLIENT_PING` (official 1.2.0 clients) keep the old
+  send-failure-only behaviour. No protocol version, packet format or discovery
+  format changes.
+
+## Apply
+
+```bash
+cd research-upstream-v1.2
+git apply --check /path/to/WFAS-Lite/patches/0002-linux-server-client-keepalive.patch
+git apply         /path/to/WFAS-Lite/patches/0002-linux-server-client-keepalive.patch
+./gradlew copyNativeLib
+./gradlew createDistributable   # or packageDeb
+```
+
+Expected log when a client dies without `CLIENT_BYE`:
+
+```text
+[SERVER][UNICAST] no CLIENT_PING for 10000ms, releasing session with /192.168.1.x:xxxxx
+```
+
+The port is then released and the discovery beacon resumes; the Windows client
+reconnects to the rebuilt server automatically.
+
+## Revert
+
+```bash
+git checkout -- src/main/kotlin/Main.kt
+```
+
+## Validation status
+
+`git apply --check` passes. This patch was **not compiled or run** in this
+environment (no Linux host, no Gradle dependencies). Rebuild and test it on the
+Mint machine before relying on it. The Windows client works with the official
+unpatched server; the patch only removes the need to kill the Linux process
+manually after a client crash.
+
 ## 0. Root cause assessment (read before applying)
 
 The Windows client now survives a burst on its own: it uses a 1 MB UDP receive

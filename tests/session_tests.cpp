@@ -40,7 +40,7 @@ constexpr std::size_t kPacketFrames = 480; // 10 ms
 // and PING keep-alives, and releases the session when CLIENT_BYE arrives.
 class FakeServer {
 public:
-    enum class Mode { normal, no_ping, silent, busy, bye_after };
+    enum class Mode { normal, no_ping, silent, busy, busy_once, bye_after };
 
     explicit FakeServer(Mode mode, int bye_after_ms = 0)
         : mode_(mode), bye_after_ms_(bye_after_ms) {
@@ -58,6 +58,9 @@ public:
     int hellos() const { return hellos_.load(std::memory_order_relaxed); }
     int client_byes() const {
         return client_byes_.load(std::memory_order_relaxed);
+    }
+    int client_pings() const {
+        return client_pings_.load(std::memory_order_relaxed);
     }
 
     void stop() {
@@ -112,18 +115,28 @@ private:
                 if (bytes <= 0) continue;
                 const std::string message(buffer, buffer + bytes);
                 if (message == "CLIENT_BYE") {
-                    // A CLIENT_BYE only releases an established session, just
-                    // like the upstream server which checks the peer address.
-                    if (session) {
+                    // A CLIENT_BYE only releases the session of the peer that
+                    // owns it, exactly like the upstream server.  This is what
+                    // makes the stable local port meaningful.
+                    if (session &&
+                        from.sin_addr.s_addr == client.sin_addr.s_addr &&
+                        from.sin_port == client.sin_port) {
                         client_byes_.fetch_add(1, std::memory_order_relaxed);
                         session = false;
                     }
                     continue;
                 }
+                if (message == "CLIENT_PING") {
+                    client_pings_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 if (message.rfind("HELLO_FROM_CLIENT", 0) == 0) {
-                    hellos_.fetch_add(1, std::memory_order_relaxed);
+                    const int hello_number =
+                        hellos_.fetch_add(1, std::memory_order_relaxed) + 1;
                     client = from;
-                    if (mode_ == Mode::busy || session) {
+                    const bool busy = mode_ == Mode::busy ||
+                                      (mode_ == Mode::busy_once && hello_number == 1);
+                    if (busy || session) {
                         send_to(socket_handle, client, "WFAS_BUSY");
                         continue;
                     }
@@ -186,6 +199,7 @@ private:
     std::atomic<unsigned short> port_{0};
     std::atomic<int> hellos_{0};
     std::atomic<int> client_byes_{0};
+    std::atomic<int> client_pings_{0};
 };
 
 struct Harness {
@@ -194,10 +208,12 @@ struct Harness {
     wfas::NullSink sink{buffer};
     wfas::UdpClientSocket socket;
     std::atomic<bool> stop{false};
+    unsigned short local_port = 0;
 
-    Harness() {
+    explicit Harness(unsigned short preferred_local_port = 0)
+        : local_port(preferred_local_port) {
         std::string error;
-        socket.open(1 << 20, error);
+        socket.open(1 << 20, preferred_local_port, error);
         sink.start(error);
     }
     ~Harness() { sink.stop(); }
@@ -210,6 +226,7 @@ struct Harness {
         config.verbose = false;
         config.ping_timeout_ms = ping_timeout_ms;
         config.handshake_timeout_ms = handshake_timeout_ms;
+        config.preferred_local_port = local_port;
         std::ostringstream discarded;
         return wfas::run_client_session(config, socket, buffer, processor, sink,
                                         stop, discarded);
@@ -228,6 +245,70 @@ void test_handshake_audio_and_server_bye() {
     check(report.peak > 0 && report.peak <= 7000,
           "bye: audio actually played at source level");
     check(report.limiter_frames == 0, "bye: peak guard not needed");
+    check(server.client_pings() > 0,
+          "bye: client sends CLIENT_PING keepalives");
+}
+
+void test_busy_once_then_connect() {
+    // A server that answers the first HELLO with WFAS_BUSY and accepts the
+    // next one must be usable without a client restart.
+    FakeServer server(FakeServer::Mode::busy_once, 700);
+    Harness harness;
+    const auto first = harness.run(server, 500, 2000);
+    check(first.end == wfas::SessionEnd::busy, "busy-once: first attempt busy");
+    check(!first.acknowledged, "busy-once: first attempt not acknowledged");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto second = harness.run(server, 500, 2000);
+    check(second.acknowledged, "busy-once: retry accepted");
+    check(second.end == wfas::SessionEnd::server_bye,
+          "busy-once: retry played and ended cleanly");
+}
+
+void test_restarted_client_releases_own_session() {
+    // The incident: the client process died, the server kept the session and
+    // answered every new HELLO with WFAS_BUSY.  A stable local port lets the
+    // restarted client send CLIENT_BYE from the same source address and
+    // release its own stale session before HELLO.
+    constexpr unsigned short kStablePort = 39123;
+    FakeServer server(FakeServer::Mode::silent);
+
+    {
+        wfas::UdpClientSocket first;
+        std::string error;
+        check(first.open(1 << 20, kStablePort, error),
+              "stable: first client binds the preferred port (" + error + ")");
+        if (first.local_port() != kStablePort) {
+            std::cerr << "SKIP: stable port " << kStablePort
+                      << " is in use; cannot run the restart test\n";
+            return;
+        }
+        check(first.connect_to("127.0.0.1", server.port(), error),
+              "stable: first client connects");
+        check(first.send_text(wfas::hello_message(), error),
+              "stable: first client sends HELLO");
+        char ack[128]{};
+        const int bytes = first.receive(ack, sizeof(ack), 1000, error);
+        check(bytes > 0 && std::string(ack, ack + bytes).rfind("HELLO_ACK", 0) == 0,
+              "stable: first client got HELLO_ACK");
+        // Simulate a crash: close without CLIENT_BYE.  The fake server still
+        // believes the session is active.
+        first.close();
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // A new process/instance on the same local port.  run_client_session sends
+    // CLIENT_BYE before HELLO, so the server releases the stale session.
+    Harness restarted(kStablePort);
+    check(restarted.socket.local_port() == kStablePort,
+          "stable: restarted client reuses the same port");
+    const auto report = restarted.run(server, 500, 2000);
+    check(report.acknowledged,
+          "stable: stale session released and new HELLO accepted");
+    check(report.end == wfas::SessionEnd::ping_timeout,
+          "stable: restarted session ran normally");
+    check(server.client_byes() >= 1,
+          "stable: server observed the releasing CLIENT_BYE");
 }
 
 void test_audio_keeps_session_alive_without_ping() {
@@ -358,7 +439,9 @@ int main() {
     test_audio_keeps_session_alive_without_ping();
     test_silent_server_times_out_and_releases();
     test_busy_is_retryable();
+    test_busy_once_then_connect();
     test_client_bye_allows_a_new_session();
+    test_restarted_client_releases_own_session();
     test_reconnect_clears_stale_audio_and_plays_again();
     test_repeated_sessions_do_not_leak_handles();
     test_session_end_classification();

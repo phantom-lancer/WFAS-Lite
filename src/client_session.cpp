@@ -112,7 +112,9 @@ UdpClientSocket::UdpClientSocket() = default;
 
 UdpClientSocket::~UdpClientSocket() { close(); }
 
-bool UdpClientSocket::open(int receive_buffer_bytes, std::string& error) {
+bool UdpClientSocket::open(int receive_buffer_bytes,
+                           unsigned short preferred_local_port,
+                           std::string& error) {
     error.clear();
     if (is_open()) return true;
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -127,6 +129,33 @@ bool UdpClientSocket::open(int receive_buffer_bytes, std::string& error) {
     const int requested = std::max(65536, receive_buffer_bytes);
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
                reinterpret_cast<const char*>(&requested), sizeof(requested));
+
+    // Prefer a stable local port.  The server keys a unicast session by the
+    // full source address, so a restarted client on the same port can release
+    // its own stale session with CLIENT_BYE even when the server never noticed
+    // the previous client disappear.  Fall back to an ephemeral port when the
+    // preferred one is already taken (for example by a second client).
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(preferred_local_port);
+    if (bind(sock, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) ==
+        SOCKET_ERROR) {
+        local.sin_port = 0;
+        if (bind(sock, reinterpret_cast<const sockaddr*>(&local),
+                 sizeof(local)) == SOCKET_ERROR) {
+            error = socket_error_text("cannot bind client UDP socket");
+            closesocket(sock);
+            return false;
+        }
+    }
+    int length = sizeof(local);
+    if (getsockname(sock, reinterpret_cast<sockaddr*>(&local), &length) == 0) {
+        local_port_ = ntohs(local.sin_port);
+    } else {
+        local_port_ = 0;
+    }
+
     handle_ = static_cast<std::uintptr_t>(sock);
     connected_ = false;
     last_error_code_ = 0;
@@ -139,6 +168,7 @@ void UdpClientSocket::close() {
         handle_ = kInvalidSocket;
     }
     connected_ = false;
+    local_port_ = 0;
 }
 
 bool UdpClientSocket::connect_to(const std::string& ip, unsigned short port,
@@ -233,7 +263,8 @@ SessionReport run_client_session(const SessionConfig& config,
 
     if (!socket.is_open()) {
         std::string error;
-        if (!socket.open(config.socket_receive_buffer_bytes, error)) {
+        if (!socket.open(config.socket_receive_buffer_bytes,
+                         config.preferred_local_port, error)) {
             report.end = SessionEnd::socket_error;
             report.error = error;
             return report;
@@ -250,6 +281,10 @@ SessionReport run_client_session(const SessionConfig& config,
     {
         std::string ignored;
         socket.send_text("CLIENT_BYE", ignored);
+        // Give the server's session reader a moment to process the release
+        // before the HELLO arrives.  Both datagrams are queued in order, but a
+        // busy server may be between receives.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
     if (config.verbose) {
@@ -344,6 +379,10 @@ SessionReport run_client_session(const SessionConfig& config,
         auto last_ping = Clock::now();
         auto last_liveness = last_ping;
         auto last_report = last_ping;
+        // A patched server uses CLIENT_PING to notice a client that vanished
+        // without CLIENT_BYE.  The official 1.2.0 server ignores this message,
+        // so sending it is fully backward compatible.
+        auto next_client_ping = Clock::now() + std::chrono::seconds(1);
         ReceiveDiagnostics diag;
         int consecutive_errors = 0;
 
@@ -412,6 +451,9 @@ SessionReport run_client_session(const SessionConfig& config,
                     if (control == "PING") {
                         last_ping = now;
                         last_liveness = now;
+                        std::string ignored;
+                        socket.send_text("CLIENT_PING", ignored);
+                        next_client_ping = now + std::chrono::seconds(3);
                     } else if (control == "BYE") {
                         if (config.verbose) out << "Sender stopped (BYE).\n";
                         report.end = SessionEnd::server_bye;
@@ -425,6 +467,11 @@ SessionReport run_client_session(const SessionConfig& config,
             // the client disconnect during a burst that overflowed the receive
             // buffer and swallowed a few keep-alives.  A truly dead sender
             // produces neither.
+            if (now >= next_client_ping) {
+                std::string ignored;
+                socket.send_text("CLIENT_PING", ignored);
+                next_client_ping = now + std::chrono::seconds(3);
+            }
             if (now - last_liveness >
                 std::chrono::milliseconds(config.ping_timeout_ms)) {
                 report.end = SessionEnd::ping_timeout;

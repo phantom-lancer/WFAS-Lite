@@ -180,6 +180,20 @@ void JitterBuffer::reset() {
 void JitterBuffer::push_locked(const std::uint8_t* pcm, std::size_t bytes) {
     bytes -= bytes % kStereoFrameBytes;
     if (!bytes) return;
+    // Stage A.6: the periodic surplus splice runs here, on the network thread,
+    // not in read().  Splitting the queue and searching for a join is O(queue)
+    // work; doing it inside the WASAPI render callback could delay the endpoint
+    // and produce a micro-freeze.  read() only advances the cadence counter.
+    if (frames_since_splice_ >= kSpliceIntervalFrames) {
+        frames_since_splice_ = 0;
+        const std::size_t level = queued_bytes_ / kStereoFrameBytes;
+        const std::size_t floor = target_frames_ + kTrimFloorFrames;
+        if (level > floor + kSpliceMinDropFrames) {
+            const std::size_t drop =
+                std::min<std::size_t>(level - floor, kMaxSpliceFrames);
+            trim_splice_locked(drop, std::min(drop, kSpliceFadeFrames));
+        }
+    }
     // A burst larger than the hard maximum is a backlog dump.  Prefer a
     // crossfaded splice inside the queue over cutting the chunk that is about
     // to play; the latter is an immediate full-amplitude step.  The front-drop
@@ -471,23 +485,6 @@ void JitterBuffer::read(std::uint8_t* output, std::size_t bytes) {
         retune_locked();
     }
     frames_since_splice_ += frames;
-
-    // Stage A.4: proportional, pitch-preserving level control.  Trim only the
-    // surplus above a small deadband, in 5-20 ms pieces, at a point ~40 ms
-    // ahead of the playhead.  This replaces the old "drop one whole front
-    // chunk every 250 ms", which cut 7 ms of audio at the playhead and was the
-    // audible rustling.  Small residual clock drift (< ~0.5 %) is still left to
-    // the resampler; larger surplus never becomes a hard cut.
-    if (frames_since_splice_ >= kSpliceIntervalFrames) {
-        frames_since_splice_ = 0;
-        const std::size_t level = queued_bytes_ / kStereoFrameBytes;
-        const std::size_t floor = target_frames_ + kTrimFloorFrames;
-        if (level > floor + kSpliceMinDropFrames) {
-            const std::size_t drop =
-                std::min<std::size_t>(level - floor, kMaxSpliceFrames);
-            trim_splice_locked(drop, std::min(drop, kSpliceFadeFrames));
-        }
-    }
 
     // Defensive only: push_locked already bounds the queue.  Keep the hard
     // maximum as a last resort so a pathological configuration can never grow
